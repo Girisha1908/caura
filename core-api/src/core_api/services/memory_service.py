@@ -1726,7 +1726,9 @@ async def create_memories_bulk(
     # item carrying that content is the one written. Scanning every index would
     # award the slot to the errored item, mark the real writer an intra-batch
     # duplicate, and skip its embedding — a vectorless row that persists,
-    # invisible to search until a backfill sweep finds it.
+    # invisible to vector search with no recovery path today (the backfill
+    # sweep is gated off by default and has never run: oss-0924-m-05,
+    # ``docs/unembedded-rows/``).
     first_writer: dict[str, int] = {}  # content hash -> index of the item that writes it
     prededuped: set[int] = set()
     for i in valid_indices:
@@ -3487,9 +3489,27 @@ async def fan_out_atomic_facts(
             if not child_id:
                 # Loud, and NOT folded into fanout_unembedded: this
                 # row is unembedded with no repair queued, which is a
-                # strictly worse state than the counted one. The
-                # nightly sweep remains its only recovery, and only
-                # where enabled.
+                # strictly worse state than the counted one. It
+                # persists with ``embedding=NULL`` and NOTHING repairs
+                # it on its own today. This used to say the nightly
+                # sweep was its recovery; that sweep is gated on
+                # ``embed_backfill_enabled``, False by default because
+                # its Pub/Sub topic is Terraform-provisioned, and it has
+                # never run (oss-0924-m-05, findings in
+                # ``docs/unembedded-rows/``). So the log names the one
+                # repairs an operator can actually run: the standalone
+                # ``backfill_embeddings`` CLI, which walks NULL
+                # embeddings with no event bus behind it — hence the
+                # tenant id, for ``--tenant-id``. That CLI embeds with
+                # the PROCESS-level provider, so under per-tenant
+                # embedding overrides it would write wrong-model vectors,
+                # worse than NULL; the log names the override-safe path
+                # too, ``core_worker.cli backfill-embeddings``, which
+                # publishes to the live hot-path EMBED_REQUESTED topic
+                # (not the gated backfill one) and needs the pubsub bus.
+                # Provision the topic and
+                # flip ``embed_backfill_enabled`` and "the nightly sweep"
+                # becomes a true answer again.
                 # Log the response SHAPE, never the response. ``child``
                 # is the created row, so it carries the raw fact text
                 # and its metadata; interpolating it here would put
@@ -3499,10 +3519,17 @@ async def fan_out_atomic_facts(
                 # content-free.
                 logger.error(
                     "atomic-fact child persisted unembedded but create_memory "
-                    "returned no usable id (response keys: %s) for parent %s; "
-                    "NO re-embed scheduled — recovery depends on the nightly sweep",
+                    "returned no usable id (response keys: %s) for parent %s "
+                    "(tenant %s); NO re-embed scheduled and no automatic "
+                    "recovery — the row stays out of vector search until "
+                    "re-embedded: run `python -m "
+                    "core_storage_api.scripts.backfill_embeddings "
+                    "--tenant-id <tenant>` (per-tenant embedding overrides: "
+                    "use `python -m core_worker.cli backfill-embeddings` "
+                    "instead — see the script's docstring)",
                     sorted(child) if isinstance(child, dict) else type(child).__name__,
                     memory_id,
+                    tenant_id,
                 )
                 continue
             # Counted only once the repair is actually queued, so the
