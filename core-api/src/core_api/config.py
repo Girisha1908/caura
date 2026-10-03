@@ -1,10 +1,10 @@
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode
 
 from common.embedding._registry import DEFAULT_LOCAL_EMBEDDING_MODEL
 from common.provider_names import DEFAULT_EMBEDDING_PROVIDER
@@ -605,7 +605,10 @@ class Settings(BaseSettings):
     security_audit_schedule_enabled: bool = False
     security_audit_schedule_cron: str = "0 2 * * *"  # daily 02:00 by default
     security_audit_alerts_enabled: bool = False
-    security_audit_alert_recipients: list[str] = []  # comma-separated env → list
+    # Comma-separated env → list. ``NoDecode`` hands the raw env string to
+    # ``_split_recipients``; without it pydantic-settings JSON-decodes
+    # ``list[str]`` first and a plain ``a@x.com,b@y.com`` crashes at import.
+    security_audit_alert_recipients: Annotated[list[str], NoDecode] = []
     security_audit_alert_score_below: float | None = None
     security_audit_alert_critical_findings_min: int | None = None
     security_audit_alert_score_drop_delta: float | None = None
@@ -633,6 +636,26 @@ class Settings(BaseSettings):
     def _split_recipients(cls, v: object) -> object:
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
+        return v
+
+    @field_validator(
+        "per_tenant_search_concurrency",
+        "per_tenant_write_concurrency",
+        "per_tenant_embed_concurrency",
+        "per_tenant_storage_write_concurrency",
+        "per_tenant_storage_search_concurrency",
+        "contradiction_detection_concurrency",
+    )
+    @classmethod
+    def _concurrency_cap_must_be_positive(cls, v: int, info: ValidationInfo) -> int:
+        # ``asyncio.Semaphore(0)`` is valid Python but every ``acquire()``
+        # blocks forever: the route-entry caps would 429 every request, the
+        # unbounded storage slots and the detection gate would stall until
+        # the caller's budget expires. 0 is not a disable switch — reject at
+        # config load so the misconfig surfaces at startup (core-worker
+        # rejects its storage-write cap the same way).
+        if v < 1:
+            raise ValueError(f"{info.field_name} must be >= 1; 0 would block every acquire of that cap")
         return v
 
     @model_validator(mode="after")
@@ -881,14 +904,14 @@ class Settings(BaseSettings):
             )
             object.__setattr__(self, "embedding_provider", "openai")
             # A user coming from Vertex likely has no OPENAI_API_KEY — without a
-            # key the registry silently falls back to FakeEmbeddingProvider,
-            # which breaks semantic search with no clear signal. Escalate.
+            # key memories are stored without embeddings, so semantic search
+            # finds nothing new. Escalate.
             if not self.openai_api_key and not self.platform_embedding_provider:
                 logger.error(
                     "EMBEDDING_PROVIDER was remapped from 'vertex' to 'openai', but "
                     "OPENAI_API_KEY is unset and PLATFORM_EMBEDDING_PROVIDER is not "
-                    "configured. Semantic search will use FakeEmbeddingProvider and "
-                    "produce zero-vectors. Set OPENAI_API_KEY or configure "
+                    "configured. Memories will be stored without embeddings (keyword "
+                    "search only). Set OPENAI_API_KEY or configure "
                     "PLATFORM_EMBEDDING_PROVIDER=openai to restore embeddings."
                 )
         if self.entity_extraction_provider == "vertex":

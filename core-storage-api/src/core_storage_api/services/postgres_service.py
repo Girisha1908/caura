@@ -2712,10 +2712,11 @@ class PostgresService:
                 .limit(SEMANTIC_DEDUP_CANDIDATE_LIMIT)
             )
 
-            if fleet_id:
-                stmt = stmt.where(Memory.fleet_id == fleet_id)
-            else:
-                stmt = stmt.where(Memory.fleet_id.is_(None))
+            # The exact-hash gate's grouping, not a falsiness branch: a row
+            # stored with ``fleet_id = ''`` matched neither ``== ''`` (never
+            # asked) nor ``IS NULL``, so a paraphrase of it was admitted while
+            # an identical write 409'd. See ``_content_hash_fleet_scope``.
+            stmt = stmt.where(_fleet_scope(Memory.fleet_id, fleet_id))
             if visibility:
                 stmt = stmt.where(Memory.visibility == visibility)
             if exclude_id is not None:
@@ -4387,10 +4388,10 @@ class PostgresService:
                 _normalized_object_sql(Memory.object_value) != _normalized_object_sql(literal(object_value)),
                 Memory.id != memory_id,
             )
-            if fleet_id:
-                stmt = stmt.where(Memory.fleet_id == fleet_id)
-            else:
-                stmt = stmt.where(Memory.fleet_id.is_(None))
+            # ``COALESCE`` grouping, as in the dedup gates: NULL and ``''`` are
+            # one fleet scope, so a row stored with ``''`` is a candidate for
+            # its own peers instead of for nobody.
+            stmt = stmt.where(_fleet_scope(Memory.fleet_id, fleet_id))
             # A54 — scope candidates to the writer's visibility tier, mirroring
             # ``memory_find_similar_candidates``. Without this the RDF path could
             # select another agent's ``scope_agent`` row as a conflict candidate
@@ -4438,10 +4439,8 @@ class PostgresService:
                 .limit(limit)
             )
 
-            if fleet_id:
-                stmt = stmt.where(Memory.fleet_id == fleet_id)
-            else:
-                stmt = stmt.where(Memory.fleet_id.is_(None))
+            # Same fleet grouping as ``memory_find_rdf_conflicts`` above.
+            stmt = stmt.where(_fleet_scope(Memory.fleet_id, fleet_id))
 
             stmt = stmt.where(Memory.visibility == visibility)
             # A54 — ``scope_agent`` means "private to SOME agent", not "private
@@ -4481,9 +4480,21 @@ class PostgresService:
         stays visible for up to one tick past its ``expires_at``, and callers
         needing a tighter guarantee are asking for a read-time filter, which
         this deliberately is not.
+
+        Every LIVE status is a candidate (``LIVE_MEMORY_STATUSES``), not only
+        ``active``. Enrichment writes rows straight in as ``confirmed`` or
+        ``pending``, and those are served by recall exactly like ``active``
+        ones; a sweep that tested ``status = 'active'`` literally left them
+        past their expiry forever — the same literal-``active`` mistake
+        ``memory_count_active`` documents. ``archived`` and the contradiction
+        outcomes are not live, so a second tick still finds nothing to do.
         """
         async with get_session() as session:
-            params: dict = {"tenant_id": tenant_id, "batch_size": batch_size}
+            params: dict = {
+                "tenant_id": tenant_id,
+                "batch_size": batch_size,
+                "live_statuses": list(LIVE_MEMORY_STATUSES),
+            }
             fleet_clause = ""
             if fleet_id:
                 fleet_clause = "AND fleet_id = :fleet_id"
@@ -4497,7 +4508,7 @@ class PostgresService:
                     WHERE tenant_id = :tenant_id
                       {fleet_clause}
                       AND (ts_valid_end < NOW() OR expires_at < NOW())
-                      AND status = 'active'
+                      AND status = ANY(:live_statuses)
                       AND deleted_at IS NULL
                     LIMIT :batch_size
                 )
@@ -9047,7 +9058,7 @@ class PostgresService:
         dupe: Entity,
         tenant_id: str,
     ) -> None:
-        """Re-point links/relations, merge aliases, delete duplicate."""
+        """Re-point links/relations/subjects, merge aliases, delete duplicate."""
         db = session
         canonical_id = canonical.id
         dupe_id = dupe.id
@@ -9167,7 +9178,24 @@ class PostgresService:
             {"dupe_id": dupe_id, "canonical_id": canonical_id, "tenant_id": tenant_id},
         )
 
-        # 4d. Merge aliases ─────────────────────────────────────────────
+        # 4d. Repoint RDF subjects ─────────────────────────────────────
+        # ``memories.subject_entity_id`` is the fourth reference to an entity
+        # (see ``_delete_entity_artifacts``) and the one the repoints above do
+        # not cover. Deleting the dupe without this left every memory whose
+        # subject it was pointing at a deleted row — or NULL where the
+        # ``ON DELETE SET NULL`` FK exists — with ``predicate`` / ``object_value``
+        # still set, so the subject-keyed contradiction path stopped seeing it.
+        await db.execute(
+            text("""
+                UPDATE memories
+                SET subject_entity_id = :canonical_id
+                WHERE subject_entity_id = :dupe_id
+                  AND tenant_id = :tenant_id
+            """),
+            {"dupe_id": dupe_id, "canonical_id": canonical_id, "tenant_id": tenant_id},
+        )
+
+        # 4e. Merge aliases ─────────────────────────────────────────────
         canonical_attrs = dict(canonical.attributes or {})
         dupe_attrs = dict(dupe.attributes or {})
         aliases: set[str] = set(canonical_attrs.get("_aliases", []))
@@ -9177,7 +9205,7 @@ class PostgresService:
         canonical_attrs["_aliases"] = sorted(aliases)  # sorted for determinism
         canonical.attributes = canonical_attrs
 
-        # 4e. Delete duplicate entity ──────────────────────────────────
+        # 4f. Delete duplicate entity ──────────────────────────────────
         await db.delete(dupe)
 
     async def entity_discover_cross_links(
@@ -9346,7 +9374,14 @@ class PostgresService:
                     # this statement carries many pairs, and ``to_insert`` is built
                     # by iterating candidates, so without this its order is
                     # whatever the scan returned.
-                    rows = _ordered_link_rows([{**row, "role": "mentioned"} for row in to_insert])
+                    # ``source`` explicitly: these links are mined from the
+                    # memory's text (the text-verify filter above is the proof),
+                    # so they are extraction's, and the edit-time reset must be
+                    # able to clear them. Left to the column default they landed
+                    # as ``caller`` and outlived every content edit.
+                    rows = _ordered_link_rows(
+                        [{**row, "role": "mentioned", "source": LINK_SOURCE_EXTRACTION} for row in to_insert]
+                    )
                     insert_link_returning = (
                         pg_insert(MemoryEntityLink)
                         .values(rows)
@@ -13058,10 +13093,15 @@ class PostgresService:
         + immediate redeploy, manual re-trigger after a recent
         successful run, etc.).
 
-        Filters on ``finished_at`` rather than ``started_at`` so an
-        in-progress row from the current attempt — pre-published by
-        the fanout endpoint just moments ago — is naturally excluded
-        (its ``finished_at`` is still NULL).
+        The window is measured from ``started_at`` -- the moment the fanout
+        wrote the row, i.e. the tick the run belongs to -- not from when it
+        finished. Keyed on ``finished_at``, a run that finished late (the
+        reconcile sweep republishing a lost message an hour or more after
+        its tick, or simply a long run) landed inside the NEXT tick's window
+        and made the org skip its next scheduled run. The in-progress row of
+        the current attempt is excluded by the ``status`` filter. The
+        ``finished_at`` bound is implied by the ``started_at`` one and kept
+        because it is what the partial dedup index is ordered on.
         """
         async with get_read_session() as session:
             row = await session.execute(
@@ -13074,6 +13114,7 @@ class PostgresService:
                 # window ran once and then skipped forever. Only real runs count.
                 .where(func.coalesce(LifecycleAudit.stats["skipped"].astext, "false") != "true")
                 .where(LifecycleAudit.finished_at > func.now() - timedelta(hours=since_hours))
+                .where(LifecycleAudit.started_at > func.now() - timedelta(hours=since_hours))
                 .limit(1)
             )
             return row.scalar_one_or_none() is not None
@@ -13842,3 +13883,30 @@ class PostgresService:
             status_code=status_code,
             expires_at=expires_at,
         )
+
+    async def idempotency_release(
+        self,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> bool:
+        """Delete a still-PENDING claim so a retry can run afresh.
+
+        Called when the handler that claimed the key failed before
+        recording a response. Without it the pending row blocks every
+        retry with "still in progress" until its pending TTL lapses,
+        masking the real (often deterministic) error. Scoped to
+        ``is_pending`` and the claim's ``request_hash`` so a completed
+        response is never discarded. Returns whether a row was deleted.
+        """
+        async with get_session() as session:
+            result = await session.execute(
+                delete(IdempotencyResponse).where(
+                    IdempotencyResponse.tenant_id == tenant_id,
+                    IdempotencyResponse.idempotency_key == idempotency_key,
+                    IdempotencyResponse.request_hash == request_hash,
+                    IdempotencyResponse.is_pending.is_(True),
+                )
+            )
+            return (result.rowcount or 0) > 0  # type: ignore[attr-defined]

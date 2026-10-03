@@ -39,9 +39,14 @@ USE_LLM_FOR_MEMORY_CREATION=true
 OPENAI_API_KEY=sk-...
 ```
 
-Without AI keys the stack still starts. Its dummy providers return
-non-semantic embeddings, which are useful for exercising the API surface but
-not for evaluating semantic recall.
+Without AI keys the stack still starts. With the default
+`EMBEDDING_PROVIDER=openai` and no key (and no `PLATFORM_EMBEDDING_*`),
+memories are stored **without** an embedding — keyword search still finds
+them, and core-api logs one ERROR naming the missing key — so they are not
+mistaken for embedded rows once a key is configured. Set
+`EMBEDDING_PROVIDER=fake` to store deterministic, non-semantic test vectors
+instead; that is useful for exercising the API surface but not for evaluating
+semantic recall.
 
 > **Want zero cloud API calls?** v2.0+ includes a self-hosted embedder profile
 > (`BAAI/bge-m3` on a
@@ -186,6 +191,31 @@ write rather than globally.
 
 `POST /search` returns matches in an `items` array. Each item contains the full
 memory plus its `similarity` score.
+
+## Upgrading
+
+Pull the new images and run `docker compose up -d`. `core-storage-api` applies
+any pending schema migrations when it starts, before it serves traffic. If a
+migration is interrupted (the container is killed or the database drops the
+connection), restart the service. Each migration either rolls back completely
+or is written to be retried, so the restart runs it again from the start.
+
+Restore a database with a full `pg_dump`, which includes the `alembic_version`
+table that records the schema revision. If that table is missing (a dump of
+selected tables, or one dropped by hand), the service records the current
+revision only when the schema shows the newest migration was applied. Otherwise
+it refuses to start, because it cannot tell how many migrations still need to
+run. Find the revision the database was really at (from the `alembic_version`
+of the database it was copied from, or the release it last ran), record it,
+and start the service. It then applies the remaining migrations. From a source
+checkout, run `alembic stamp <revision>` from the repository root. With the
+compose stack, write the same row directly:
+
+```bash
+docker compose exec db psql -U caura -d caura -c \
+  "CREATE TABLE alembic_version (version_num varchar(32) PRIMARY KEY);
+   INSERT INTO alembic_version VALUES ('<revision>');"
+```
 
 ## Authentication modes
 

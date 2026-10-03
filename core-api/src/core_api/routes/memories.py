@@ -53,6 +53,7 @@ from core_api.middleware.idempotency import (
     IdempotencyGuard,
     idempotency_for,
     idempotency_key_from_metadata,
+    release_claim_on_error,
 )
 from core_api.middleware.per_tenant_concurrency import per_tenant_slot
 from core_api.middleware.rate_limit import search_limit, write_bulk_limit, write_limit
@@ -1394,7 +1395,9 @@ async def write_memory(
     # already saturating its slot budget on this instance, instead of
     # queueing requests until they time out at the worker layer. Only
     # the new-write path is gated; replays returned above bypass it.
-    async with per_tenant_slot("write", body.tenant_id):
+    # A failure from here on (including that 429) releases the claim so the
+    # retry sees the real outcome, not a synthetic "still in progress" 409.
+    async with release_claim_on_error(_idem), per_tenant_slot("write", body.tenant_id):
         return await _write_memory_inner(body, response, auth, _idem, chosen_agent_id)
 
 
@@ -1435,11 +1438,15 @@ async def _write_memory_inner(
     usage = None
     if auth.tenant_id:  # skip enforcement + metering for admin
         await enforce_fleet_write(body.tenant_id, body.agent_id, body.fleet_id)
-        if charges_write_quota("create"):
-            usage = await check_and_increment(body.tenant_id, "write")
-    set_usage_headers(response, usage)
     _observe_rest_reserved_write(auth, body.agent_id or chosen_agent_id)
     result = await create_memory(body)
+    # Metered only after the write succeeded, like the bulk route: a write that
+    # raised wrote nothing, and a client retrying it must not pay per attempt.
+    # The meter only records (enforcement travels via ``x-org-read-only``), so
+    # moving it past the write gates nothing.
+    if auth.tenant_id and charges_write_quota("create"):
+        usage = await check_and_increment(body.tenant_id, "write")
+    set_usage_headers(response, usage)
     # STM writes return STMWriteResponse (different shape from MemoryOut)
     if isinstance(result, STMWriteResponse):
         stm_body = result.model_dump(mode="json")
@@ -1612,7 +1619,7 @@ async def write_memories_bulk(
         # quota-increment, so no rate-limit headers are available to
         # carry on the cached response.
         return JSONResponse(content=_body, status_code=_status)
-    async with per_tenant_slot("write", body.tenant_id):
+    async with release_claim_on_error(_idem), per_tenant_slot("write", body.tenant_id):
         return await _write_memories_bulk_inner(body, response, auth, _idem, bulk_attempt_id, chosen_agent_id)
 
 
@@ -2711,11 +2718,13 @@ async def ingest_commit_endpoint(
         # counter feeds ``_is_over_plan_limits``, so the cheapest way past a
         # write cap was to ingest in bulk.
         #
-        # Before the write, matching the ordering
-        # ``test_billing_happens_before_the_write`` pins for the MCP surface: a
-        # batch that fails partway still costs what it attempted, and two
-        # orderings for one operation is the drift that test exists to stop.
+        #
+        # AFTER the write, the ordering every write surface now shares (REST
+        # single and bulk, MCP single and batch): a commit that raised wrote
+        # nothing, and a client retrying it must not pay once per attempt.
+        result = await ingest_commit(body)
         await bulk_check_and_increment(body.tenant_id, len(body.facts))
+        return result
     return await ingest_commit(body)
 
 

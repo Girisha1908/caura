@@ -9,13 +9,18 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from common.embedding import get_embedding
+from common.embedding import embedding_configured, get_embedding
 from core_api import openapi_responses as _oar
 from core_api.agent_ids import canonical_service_agent_id
 from core_api.auth import AuthContext, get_auth_context
 from core_api.clients.storage_client import get_storage_client
 from core_api.constants import DEFAULT_DOC_SEARCH_TOP_K, MAX_DOC_SEARCH_TOP_K
-from core_api.middleware.idempotency import IDEMPOTENCY_HEADER, idempotency_for
+from core_api.middleware.idempotency import (
+    IDEMPOTENCY_HEADER,
+    IdempotencyGuard,
+    idempotency_for,
+    release_claim_on_error,
+)
 from core_api.middleware.rate_limit import write_limit
 from core_api.schemas import STRICT_WRITE_BODY, TenantScopedBody
 from core_api.services.agent_service import (
@@ -469,7 +474,18 @@ async def upsert_document(
     if _idem and (_replay := _idem.cached_replay):
         _body, _status = _replay
         return JSONResponse(content=_body, status_code=_status)
+    # A failure after the claim releases it, so a retry sees the real error
+    # rather than "still in progress" until the pending claim times out.
+    async with release_claim_on_error(_idem):
+        return await _upsert_document_claimed(body, auth, author, _idem)
 
+
+async def _upsert_document_claimed(
+    body: DocWriteRequest,
+    auth: AuthContext,
+    author: str | None,
+    _idem: IdempotencyGuard | None,
+) -> DocOut:
     # Skills slug rule — doc_id becomes a directory name on plugin-side
     # reconciliation, so it must be filesystem-safe. Note: the slug
     # rule is permissive enough to allow ``forge/<slug>`` / ``agent/<slug>``
@@ -626,7 +642,10 @@ async def upsert_document(
         # below if it returns None, so it must not sit on the reduced
         # deferred budget. See EMBEDDING_INTERACTIVE_RESERVED_SLOTS.
         embedding = await get_embedding(source, tenant_config, background=False)
-        if embedding is None:
+        # No provider configured is not a provider failure: store the document
+        # unindexed (``indexed=False``) rather than with a stand-in vector, or
+        # refuse a write that no retry could ever fix.
+        if embedding is None and embedding_configured(tenant_config):
             raise HTTPException(
                 status_code=502,
                 detail=(

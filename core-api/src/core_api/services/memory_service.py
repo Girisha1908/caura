@@ -38,6 +38,7 @@ except ImportError:
 
 from common.constants import VECTOR_DIM
 from common.embedding import (
+    embedding_configured,
     get_embedding,
     get_embeddings_batch,
     get_query_embedding,
@@ -2079,11 +2080,8 @@ async def create_memories_bulk(
         if weight is None:
             weight = DEFAULT_MEMORY_WEIGHT
 
-        status = item.status
-        if not status and enrichment:
-            status = getattr(enrichment, "status", None)
-        if not status:
-            status = "active"
+        # Never from enrichment — see ``MergeEnrichmentFields``.
+        status = item.status or "active"
 
         entity_link_dicts = [
             {"entity_id": str(link.entity_id), "role": link.role} for link in item.entity_links
@@ -2896,6 +2894,17 @@ async def _reembed_memory(
     except Exception:
         logger.warning("Failed to resolve tenant config for re-embed (tenant=%s)", tenant_id, exc_info=True)
         tenant_config = None
+
+    # No real provider configured: retrying cannot produce a vector, so record
+    # the row as unembedded once instead of spending the retry budget on it.
+    if not embedding_configured(tenant_config):
+        await _record_stranded(
+            memory_id,
+            tenant_id,
+            "no embedding provider is configured; the row stays embedding=NULL "
+            "until one is and the row is re-embedded",
+        )
+        return
 
     embedding = None
     for attempt in range(1, _REEMBED_MAX_RETRIES + 1):
@@ -3923,9 +3932,12 @@ async def _enrich_memory_background(
             patch["ts_valid_start"] = enrichment.ts_valid_start
         if not _agent_pinned("ts_valid_end", mem.get("ts_valid_end") is None) and enrichment.ts_valid_end:
             patch["ts_valid_end"] = enrichment.ts_valid_end
-        # Status: enrichment may set it only when the caller did not.
-        if not _agent_pinned("status", mem.get("status") == "active") and enrichment.status:
-            patch["status"] = enrichment.status
+        # Status is NOT written here. It is a lifecycle field owned by explicit
+        # setters (transitions, contradiction detection, the crystallizer,
+        # delete), the classifier is not asked for it (CAURA-719), and this task
+        # runs after the write: patching it could revert a transition made in
+        # the meantime. core-worker's ``_ENRICHMENT_UNROUTED_FIELDS`` makes the
+        # same call for the deferred path.
 
         meta.pop("enrichment_pending", None)
         # B7 x C25 — this path REPLACES metadata wholesale, so clear the
@@ -3934,18 +3946,9 @@ async def _enrich_memory_background(
             meta["_system"].pop("enrichment_pending", None)
         patch["metadata_"] = meta
 
-        # Apply patch via storage client -- use update_memory_status for status
-        # and a general patch for other fields
+        # Apply patch via storage client (metadata, type, weight, etc.)
         if patch:
-            # The storage API update_memory_status handles status changes;
-            # for other fields we need to build the right call
-            status_val = patch.pop("status", None)
-            if patch:
-                # Use a generic memory patch (metadata, type, weight, etc.)
-                # Fall back to update via scored-search patch endpoint
-                await sc.update_memory(str(memory_id), tenant_id, patch)
-            if status_val:
-                await sc.update_memory_status(str(memory_id), status_val, tenant_id=tenant_id)
+            await sc.update_memory(str(memory_id), tenant_id, patch)
 
         # The enrichment signal is persisted, so the verdict now exists. These
         # are the five keys ``remediate_after_enrichment`` reads, assembled from

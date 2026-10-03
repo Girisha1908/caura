@@ -21,6 +21,7 @@ the dispatch never branches on a string.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -147,6 +148,11 @@ LifecycleStorageAdapter = ArchiveStorageAdapter
 # the legitimate next-day tick through.
 _PIPELINE_DEDUP_WINDOW_HOURS = 23
 
+# Bound on the claim-release write a cancelled run makes on its way out. It
+# runs inside the shutdown that cancelled it, so it must not eat the SIGTERM
+# budget; if it cannot finish in time the claim lapses with its lease instead.
+_CANCEL_RELEASE_TIMEOUT_SECONDS = 2.0
+
 
 # Callable parameters are contravariant: an op that accepts a
 # ``LifecycleArchiveRequest`` (subclass) is NOT assignable to a
@@ -179,8 +185,11 @@ async def _run_action(
     if a successful run for the same org+action exists within the
     window, this delivery is a no-op (audit row marked success with
     ``stats.skipped`` so observers can distinguish "did the work" from
-    "skipped because already done"). Filtering on ``finished_at``
-    naturally excludes the in-progress row pre-published moments ago.
+    "skipped because already done"). Only ``success`` rows count, so the
+    in-progress row pre-published moments ago is naturally excluded, and the
+    window is measured from each row's tick (``started_at``) rather than
+    from when it finished, so a late-finishing run cannot push the next
+    scheduled tick into a skip.
     """
     try:
         # ``model_validate`` (not a kwargs-splat) so a non-dict payload
@@ -340,6 +349,33 @@ async def _run_action(
 
     try:
         count = await run_op(request)
+    except asyncio.CancelledError:
+        # Cancelled mid-run -- in practice a shutdown that outlasted the bus's
+        # stop grace. ``except Exception`` does not see this, so the row used to
+        # stay ``in_progress`` under our claim, and since the message was neither
+        # acked nor nacked its redelivery hit ``claim_conflict`` and nacked until
+        # the claim lease expired, an hour later. Finalise the row as a failure
+        # with our token so the redelivery can claim it straight away, then
+        # re-raise: cancellation is not ours to swallow.
+        try:
+            await asyncio.wait_for(
+                adapter.update_lifecycle_audit_row(
+                    audit_id,
+                    org_id=org_id,
+                    status="failure",
+                    error_message="interrupted: the consumer was cancelled mid-run",
+                    claim_token=claim_token,
+                ),
+                timeout=_CANCEL_RELEASE_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            logger.warning(
+                "lifecycle audit claim release after cancellation failed; "
+                "the claim lapses with its lease",
+                exc_info=True,
+                extra={"audit_id": audit_id, "action": action},
+            )
+        raise
     except Exception as exc:
         # ``PermanentOpError`` means the op has established that a retry cannot
         # help, so this handler acks instead of nacking. Both classes write the
