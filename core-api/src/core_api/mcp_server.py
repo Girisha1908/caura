@@ -1366,14 +1366,14 @@ async def caura_recall(
     fleet_ids: Annotated[list[str] | None, Field(description="Restrict fleets.")] = None,
     include_brief: Annotated[bool, Field(description="Add LLM summary.")] = False,
     top_k: Annotated[
-        int,
+        int | None,
         Field(
             description=f"Max results, default {DEFAULT_SEARCH_TOP_K}. "
             f"Values above {MAX_SEARCH_TOP_K} are capped to {MAX_SEARCH_TOP_K}. "
             "Superseded hits add their newest correction beyond this cap, "
             "marked injected:true."
         ),
-    ] = DEFAULT_SEARCH_TOP_K,
+    ] = None,
     valid_at: Annotated[
         str | None,
         Field(
@@ -1479,7 +1479,11 @@ async def caura_recall(
     # ``effective_top_k: -5``, reporting the bad value back as if honoured.
     # ``max(1, min(...))`` is the same clamp the doc-search path in this file
     # already uses; this one had only half of it.
-    capped_top_k = max(1, min(top_k, MAX_SEARCH_TOP_K))
+    #
+    # M-19: a top_k the caller names beats a tuned profile, as on REST; one it
+    # leaves out is the agent profile's or the tenant default's to set.
+    top_k_explicit = top_k is not None
+    capped_top_k = max(1, min(top_k if top_k is not None else DEFAULT_SEARCH_TOP_K, MAX_SEARCH_TOP_K))
 
     # Audit finding P3: prior implementation held ``_mcp_session()``
     # open across the brief-generation LLM round-trip (~5-30s), pinning
@@ -1536,6 +1540,8 @@ async def caura_recall(
         # identity, but ``diagnostic=true`` and an empty result set still make
         # this False here.
         recall_ctx: dict = {}
+        # The top_k the search resolved, and any strategy cut of it.
+        retrieval_ctx: dict = {}
         results = await search_memories(
             tenant_id=tenant_id,
             query=query,
@@ -1546,6 +1552,7 @@ async def caura_recall(
             memory_type_filter=memory_type,
             status_filter=status,
             top_k=capped_top_k,
+            top_k_explicit=top_k_explicit,
             valid_at=parsed_valid_at,
             recall_boost=config.recall_boost,
             graph_expand=config.graph_expand,
@@ -1558,6 +1565,7 @@ async def caura_recall(
             diagnostic_ctx=diagnostic_ctx if diagnostic else None,
             min_similarity=min_similarity,
             recall_ctx=recall_ctx,
+            retrieval_ctx=retrieval_ctx,
         )
         # Cross-tenant read audit (F2): emit one event per source tenant when
         # the credential widened beyond home. Async queue — non-blocking.
@@ -1598,9 +1606,13 @@ async def caura_recall(
             "count": len(_rows),
             # Against the CLAMPED value, so a negative top_k is not reported as
             # a truncation of a larger request.
-            "truncated": top_k > capped_top_k,
+            "truncated": top_k is not None and top_k > capped_top_k,
             "requested_top_k": top_k,
-            "effective_top_k": capped_top_k,
+            # What the search ran with: a strategy's cut, else the top_k it
+            # resolved from the request, profile or default (M-19).
+            "effective_top_k": retrieval_ctx.get("effective_top_k")
+            or retrieval_ctx.get("resolved_top_k")
+            or capped_top_k,
             "recall_tracked": bool(recall_ctx.get("recall_tracked")),
         }
         if diagnostic:
@@ -1634,7 +1646,11 @@ async def caura_recall(
                 results,
                 query,
                 config,
+                # M-20: the as-of date anchors the brief's relative dates, as on
+                # REST /recall.
+                valid_at=parsed_valid_at,
                 top_k=capped_top_k,
+                t0=t0,
                 # ax-0917-h-03 — no ``items`` inside the brief. This payload
                 # ALREADY carries the identical rows twice, under ``results``
                 # and its permanent ``items`` alias above; the brief used to add
@@ -2326,11 +2342,22 @@ async def caura_manage(
                         ),
                         t0,
                     )
+                # Built before the charge: a value the model rejects (weight above
+                # 1, an unknown memory_type or status, empty content) is the
+                # caller's error, answered as INVALID_ARGUMENTS and not billed.
+                # Uncaught, it reached the client as an unstructured tool error
+                # after the charge (M-22), the twin of caura_write's fix.
+                try:
+                    patch = MemoryUpdate(**fields)
+                except ValidationError as e:
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", f"Invalid update arguments — {e}"), t0
+                    )
                 # WRITE → home tenant only. ``update_memory`` is storage-routed
                 # and scopes the row to the explicit ``tenant_id``.
                 if charges_write_quota("update"):
                     await check_and_increment(tenant_id, "write")
-                result = await update_memory(uid, tenant_id, MemoryUpdate(**fields), agent_id=agent_id)
+                result = await update_memory(uid, tenant_id, patch, agent_id=agent_id)
                 return _with_latency(_serialize(result), t0)
             # op == "delete" — WRITE → home tenant only.
             #
@@ -2423,8 +2450,11 @@ async def caura_entity_get(
     except Exception as e:
         logger.exception("Unhandled error in caura_entity_get")
         return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
-    text = "Entity not found." if not result else _serialize(result)
-    return _with_latency(text, t0)
+    if not result:
+        # The envelope, as REST's 404 (M-23). A hidden entity is ``None`` too
+        # (M-83), so it answers exactly as a missing id.
+        return _with_latency(_error_response("NOT_FOUND", "Entity not found."), t0)
+    return _with_latency(_serialize(result), t0)
 
 
 async def caura_tune(
@@ -3093,8 +3123,11 @@ async def caura_doc(
                     doc_id=doc_id,
                     readable_tenant_ids=readable,
                 )
+                # One reply for a missing doc and a hidden skill below, so neither
+                # leaks existence; the envelope, as REST's 404 (M-23). It was prose.
+                not_found = _error_response("NOT_FOUND", f"Not found: {collection}/{doc_id}")
                 if not doc:
-                    return _with_latency(f"Not found: {collection}/{doc_id}", t0)
+                    return _with_latency(not_found, t0)
                 # Active-only gate for agent-facing skill reads. A
                 # candidate / staged / quarantined / rejected skill is
                 # in-flight or blocked and must not surface to agents —
@@ -3111,7 +3144,7 @@ async def caura_doc(
                     if _skill_hidden_from_agent(
                         doc, caller_tenant_id=tenant_id, caller_opted_in=caller_opted_in
                     ):
-                        return _with_latency(f"Not found: {collection}/{doc_id}", t0)
+                        return _with_latency(not_found, t0)
                 return _with_latency(
                     _dumps(
                         {
@@ -3376,8 +3409,12 @@ async def caura_doc(
                 require_status=_AGENT_VISIBLE_SKILL_STATUS if skills_gate_on else None,
             )
             if not deleted:
+                # The envelope, as REST's 404 (M-23). A bare ``{"error": "<string>"}``
+                # carried no code and reached clients as a successful call.
                 return _with_latency(
-                    _dumps({"error": f"Document '{doc_id}' not found in collection '{collection}'"}),
+                    _error_response(
+                        "NOT_FOUND", f"Document '{doc_id}' not found in collection '{collection}'."
+                    ),
                     t0,
                 )
             # Un-mint, exactly as the REST delete does. ``op=index`` above mints
